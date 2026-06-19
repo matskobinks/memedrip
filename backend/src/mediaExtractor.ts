@@ -88,9 +88,13 @@ const extractMetaUrl = (html: string): string | null => {
   return null;
 };
 
+const hostMatches = (hostname: string, expectedHost: string): boolean => {
+  return hostname === expectedHost || hostname.endsWith(`.${expectedHost}`);
+};
+
 const isGifProvider = (url: URL): boolean => {
   const host = url.hostname.toLowerCase();
-  return host.includes("tenor.com") || host.includes("giphy.com") || host.includes("media.giphy.com");
+  return hostMatches(host, "tenor.com") || hostMatches(host, "giphy.com") || hostMatches(host, "media.giphy.com");
 };
 
 const resolveWithTimeout = async (url: string, fetchFn: typeof fetch): Promise<Response> => {
@@ -122,7 +126,7 @@ export const resolveGifSourceUrl = async (link: string, fetchFn: typeof fetch = 
     return null;
   }
 
-  if (parsed.hostname.includes("media.giphy.com")) {
+  if (hostMatches(parsed.hostname.toLowerCase(), "media.giphy.com")) {
     return link;
   }
 
