@@ -1,0 +1,77 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, -apple-system, Segoe UI, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at top, #1a1b24, #101117 60%);
+  color: #f4f5f9;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 700;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.86rem;
+  color: #b8bdd0;
+}
+
+input {
+  border: 1px solid #2a3146;
+  border-radius: 10px;
+  background: #161a24;
+  color: #f4f5f9;
+  padding: 10px;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.9rem;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.dot.ok {
+  background: #35d07f;
+}
+
+.dot.ko {
+  background: #f05b6c;
+}
+
+button {
+  margin-top: 4px;
+  border: 0;
+  border-radius: 10px;
+  padding: 10px 14px;
+  background: #5a7dff;
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.error {
+  margin: 0;
+  color: #ff9aa7;
+  font-size: 0.8rem;
+}

@@ -1,0 +1,8 @@
+node_modules/
+**/node_modules/
+backend/dist/
+client/dist/
+client/dist-electron/
+*.log
+.DS_Store
+.env
