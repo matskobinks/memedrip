@@ -1,0 +1,26 @@
+{
+  "name": "memedrip",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ultra-low-latency Discord-to-Desktop media overlay",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build:shared": "npm run build -w @memedrip/shared-types",
+    "build:bot": "npm run build -w @memedrip/bot",
+    "build:all": "npm run build:shared && npm run build:bot",
+    "dev:bot": "npm run dev -w @memedrip/bot",
+    "dev:overlay": "npm run dev -w @memedrip/overlay",
+    "start:bot": "npm run start -w @memedrip/bot"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.9.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

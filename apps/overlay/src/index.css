@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ensure the root element is truly transparent so Tauri's
+   window transparency shows the desktop/game beneath. */
+:root {
+  background: transparent;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent !important;
+  overflow: hidden;
+  /* CSS-level click-through: the entire overlay ignores pointer events.
+     This is a complement to Tauri's set_ignore_cursor_events(true). */
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Use GPU-accelerated transforms for animations to avoid repainting */
+* {
+  -webkit-font-smoothing: antialiased;
+  will-change: transform, opacity;
+}
