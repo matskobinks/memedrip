@@ -10,9 +10,17 @@
  *   Discord slash command ──▶ command handler ──▶ relay.send(targetId, payload)
  *   Desktop client ◀── WebSocket ── relay (auth by Discord ID)
  *
- * Scaling note: when you outgrow a single process, extract the relay
- * into its own service and use Redis Pub/Sub as the bus.  The
- * RelayServer API below already isolates that boundary.
+ * Upgrades from V1:
+ *   - Rate limiting (per-sender, per-target)
+ *   - HTTPS-only URL enforcement (SSRF protection)
+ *   - WebSocket maxPayload cap (64 KiB)
+ *   - Unhandled rejection / uncaught exception guards
+ *   - Token expiry (nonce + timestamp, 24h validity)
+ *   - Structured logging via pino
+ *   - Discord interaction buttons (Skip / Clear / Pause)
+ *   - /drop random (serves from a media directory)
+ *   - WSS/TLS support
+ *   - Real health endpoint
  */
 
 import {
@@ -23,16 +31,44 @@ import {
   REST,
   Routes,
   Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  type ButtonInteraction,
 } from "discord.js";
 import { WebSocketServer, WebSocket } from "ws";
-import { randomUUID, createHash } from "node:crypto";
+import {
+  createHash,
+  randomUUID,
+  randomBytes,
+  createHmac,
+} from "node:crypto";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { join, extname } from "node:path";
+import { createServer as createHttpServer } from "node:http";
+import { readFileSync as readPem } from "node:fs";
+import pino from "pino";
 import {
   type MediaPayload,
   type RelayMessage,
   type MediaType,
+  type OverlayPosition,
+  type OverlayScale,
+  type ControlAction,
   DEFAULT_DURATION_MS,
-  isMediaPayload,
+  RATE_LIMIT_WINDOW_MS,
+  RATE_LIMIT_MAX_DROPS,
 } from "@memedrip/shared-types";
+
+// ---------------------------------------------------------------------------
+// Structured logging (#17)
+// ---------------------------------------------------------------------------
+const log = pino({
+  level: process.env.LOG_LEVEL || "info",
+  transport: process.env.NODE_ENV !== "production"
+    ? { target: "pino-pretty", options: { colorize: true, translateTime: "SYS:standard" } }
+    : undefined,
+});
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -42,13 +78,113 @@ const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID!;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || undefined;
 const WS_PORT = parseInt(process.env.WS_PORT || "7878", 10);
 const RELAY_AUTH_SECRET = process.env.RELAY_AUTH_SECRET!;
+const MEDIA_DIR = process.env.MEDIA_DIR || "";
+const TLS_CERT_PATH = process.env.TLS_CERT_PATH || "";
+const TLS_KEY_PATH = process.env.TLS_KEY_PATH || "";
+const HEALTH_PORT = parseInt(process.env.HEALTH_PORT || "7879", 10);
+const TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !RELAY_AUTH_SECRET) {
-  console.error(
-    "[FATAL] Missing required env vars. Set DISCORD_TOKEN, DISCORD_CLIENT_ID, RELAY_AUTH_SECRET.",
+  log.fatal(
+    "Missing required env vars. Set DISCORD_TOKEN, DISCORD_CLIENT_ID, RELAY_AUTH_SECRET.",
   );
   process.exit(1);
 }
+
+// ---------------------------------------------------------------------------
+// Token manager (#5 — token expiry + nonce)
+// ---------------------------------------------------------------------------
+class TokenManager {
+  /**
+   * Issue a signed token: HMAC-SHA256(secret, `discordId:nonce:timestamp`).
+   * The token encodes the issue time so the server can reject stale tokens
+   * without maintaining a database — just verify the HMAC and check age.
+   */
+  issue(discordId: string): { token: string; expiresAt: number } {
+    const nonce = randomBytes(8).toString("hex");
+    const ts = Date.now();
+    const payload = `${discordId}:${nonce}:${ts}`;
+    const sig = createHmac("sha256", RELAY_AUTH_SECRET).update(payload).digest("hex");
+    return {
+      token: `${payload}.${sig}`,
+      expiresAt: ts + TOKEN_TTL_MS,
+    };
+  }
+
+  /** Verify a token's HMAC signature and expiry. */
+  verify(token: string, discordId: string): boolean {
+    const parts = token.split(".");
+    if (parts.length !== 4) return false;
+    const [id, nonce, tsStr, sig] = parts;
+    if (id !== discordId) return false;
+
+    const ts = parseInt(tsStr, 10);
+    if (isNaN(ts) || Date.now() - ts > TOKEN_TTL_MS) return false;
+
+    const payload = `${id}:${nonce}:${tsStr}`;
+    const expectedSig = createHmac("sha256", RELAY_AUTH_SECRET).update(payload).digest("hex");
+
+    // Constant-time comparison
+    if (sig.length !== expectedSig.length) return false;
+    let diff = 0;
+    for (let i = 0; i < sig.length; i++) {
+      diff |= sig.charCodeAt(i) ^ expectedSig.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+
+  /**
+   * Legacy V1 deterministic token (sha256(secret:discordId)).
+   * Kept for backward compat with clients that haven't been updated.
+   */
+  verifyLegacy(token: string, discordId: string): boolean {
+    const expected = createHash("sha256")
+      .update(`${RELAY_AUTH_SECRET}:${discordId}`)
+      .digest("hex");
+    if (token.length !== expected.length) return false;
+    let diff = 0;
+    for (let i = 0; i < token.length; i++) {
+      diff |= token.charCodeAt(i) ^ expected.charCodeAt(i);
+    }
+    return diff === 0;
+  }
+}
+const tokenManager = new TokenManager();
+
+// ---------------------------------------------------------------------------
+// Rate limiter (#1 — per-sender cooldown)
+// ---------------------------------------------------------------------------
+class RateLimiter {
+  /** Map<senderId, array of timestamps> */
+  private hits = new Map<string, number[]>();
+
+  /** Returns true if the sender is allowed to drop now, false if rate-limited. */
+  check(senderId: string): boolean {
+    const now = Date.now();
+    const cutoff = now - RATE_LIMIT_WINDOW_MS;
+    const timestamps = (this.hits.get(senderId) || []).filter((t) => t > cutoff);
+
+    if (timestamps.length >= RATE_LIMIT_MAX_DROPS) {
+      this.hits.set(senderId, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    this.hits.set(senderId, timestamps);
+    return true;
+  }
+
+  /** Periodic cleanup of stale entries to prevent memory growth. */
+  sweep(): void {
+    const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
+    this.hits.forEach((timestamps, id) => {
+      const fresh = timestamps.filter((t) => t > cutoff);
+      if (fresh.length === 0) this.hits.delete(id);
+      else this.hits.set(id, fresh);
+    });
+  }
+}
+const rateLimiter = new RateLimiter();
+setInterval(() => rateLimiter.sweep(), 60_000).unref();
 
 // ---------------------------------------------------------------------------
 // Relay Server — in-memory registry of connected desktop clients
@@ -56,21 +192,35 @@ if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !RELAY_AUTH_SECRET) {
 interface ClientEntry {
   ws: WebSocket;
   discordId: string;
-  /** Heartbeat: if we don't receive a pong within this window, drop. */
   alive: boolean;
+  connectedAt: number;
 }
 
 class RelayServer {
   private clients = new Map<string, ClientEntry>(); // discordId → entry
   private wss: WebSocketServer;
 
-  constructor(port: number) {
-    this.wss = new WebSocketServer({ port });
-    this.wss.on("connection", (ws) => this.onConnection(ws));
-    console.log(`[relay] WebSocket server listening on :${port}`);
+  constructor(port: number, useTLS: boolean) {
+    const opts: ConstructorParameters<typeof WebSocketServer>[0] = {
+      port,
+      // #3 — cap message size at 64 KiB to prevent memory exhaustion
+      maxPayload: 64 * 1024,
+    };
 
-    // Heartbeat sweep every 30s — mark dead clients and terminate them.
-    setInterval(() => this.sweepDeadClients(), 30_000).unref();
+    if (useTLS) {
+      // #16 — WSS/TLS support
+      const https = require("node:https") as typeof import("node:https");
+      const server = https.createServer({
+        cert: readPem(TLS_CERT_PATH),
+        key: readPem(TLS_KEY_PATH),
+      });
+      opts.server = server;
+      log.info({ tls: true, cert: TLS_CERT_PATH }, "[relay] TLS enabled");
+    }
+
+    this.wss = new WebSocketServer(opts);
+    this.wss.on("connection", (ws) => this.onConnection(ws));
+    log.info({ port, tls: useTLS }, "[relay] WebSocket server listening");
   }
 
   private onConnection(ws: WebSocket): void {
@@ -85,7 +235,11 @@ class RelayServer {
       }
     }, 10_000);
 
-    ws.on("message", (raw: Buffer) => {
+    ws.on("message", (raw: Buffer, isBinary: boolean) => {
+      if (isBinary) {
+        this.send(ws, { type: "error", reason: "Binary messages not supported" });
+        return;
+      }
       let msg: RelayMessage;
       try {
         msg = JSON.parse(raw.toString()) as RelayMessage;
@@ -101,18 +255,20 @@ class RelayServer {
           ws.close(4003, "Not authenticated");
           return;
         }
-        if (!this.verifyToken(msg.token, msg.discordId)) {
-          this.send(ws, { type: "auth_error", reason: "Invalid token" });
+        const ok = tokenManager.verify(msg.token, msg.discordId)
+          || tokenManager.verifyLegacy(msg.token, msg.discordId);
+        if (!ok) {
+          this.send(ws, { type: "auth_error", reason: "Invalid or expired token" });
           ws.close(4003, "Invalid token");
           return;
         }
         authenticated = true;
         discordId = msg.discordId;
-        entry = { ws, discordId, alive: true };
+        entry = { ws, discordId, alive: true, connectedAt: Date.now() };
         this.clients.set(discordId, entry);
         clearTimeout(authTimeout);
         this.send(ws, { type: "auth_ok" });
-        console.log(`[relay] Client connected: ${discordId}`);
+        log.info({ discordId }, "[relay] Client connected");
         return;
       }
 
@@ -125,7 +281,6 @@ class RelayServer {
           this.send(ws, { type: "pong" });
           break;
         default:
-          // Desktop clients only send auth + pong; anything else is ignored.
           break;
       }
     });
@@ -134,23 +289,28 @@ class RelayServer {
       clearTimeout(authTimeout);
       if (discordId && this.clients.get(discordId)?.ws === ws) {
         this.clients.delete(discordId);
-        console.log(`[relay] Client disconnected: ${discordId}`);
+        log.info({ discordId }, "[relay] Client disconnected");
       }
     });
 
     ws.on("error", (err) => {
-      console.error(`[relay] Socket error for ${discordId ?? "unauth"}:`, err.message);
+      log.error({ err: err.message, discordId: discordId ?? "unauth" }, "[relay] Socket error");
     });
   }
 
-  /**
-   * Push a media payload to a single targeted client.
-   * Returns true if delivered, false if the client is offline.
-   */
+  /** Push a media payload to a single targeted client. */
   sendTo(targetId: string, payload: MediaPayload): boolean {
     const entry = this.clients.get(targetId);
     if (!entry || entry.ws.readyState !== WebSocket.OPEN) return false;
     this.send(entry.ws, { type: "media", payload });
+    return true;
+  }
+
+  /** Send a control action (skip/clear/pause/resume) to a client. */
+  sendControl(targetId: string, action: ControlAction): boolean {
+    const entry = this.clients.get(targetId);
+    if (!entry || entry.ws.readyState !== WebSocket.OPEN) return false;
+    this.send(entry.ws, { type: "control", action });
     return true;
   }
 
@@ -160,13 +320,22 @@ class RelayServer {
     return !!e && e.ws.readyState === WebSocket.OPEN;
   }
 
+  /** Number of currently connected clients. */
+  getConnectedCount(): number {
+    let count = 0;
+    this.clients.forEach((e) => {
+      if (e.ws.readyState === WebSocket.OPEN) count++;
+    });
+    return count;
+  }
+
   /** Send a heartbeat ping to every connected client. */
   private sweepDeadClients(): void {
     this.clients.forEach((entry, id) => {
       if (!entry.alive) {
         entry.ws.terminate();
         this.clients.delete(id);
-        console.log(`[relay] Swept dead client: ${id}`);
+        log.info({ discordId: id }, "[relay] Swept dead client");
         return;
       }
       entry.alive = false;
@@ -174,44 +343,45 @@ class RelayServer {
     });
   }
 
-  // --- helpers ---
   private send(ws: WebSocket, msg: RelayMessage): void {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
   }
 
-  /**
-   * V1 token verification: HMAC-style comparison of `sha256(secret + discordId)`.
-   * In production, replace with a real JWT or OAuth exchange — the desktop
-   * client obtains this token by logging in via Discord OAuth and the
-   * backend signs it.  For V1 the token is derived deterministically.
-   */
-  private verifyToken(token: string, discordId: string): boolean {
-    const expected = this.computeToken(discordId);
-    // Constant-time comparison
-    if (token.length !== expected.length) return false;
-    let diff = 0;
-    for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ expected.charCodeAt(i);
-    return diff === 0;
-  }
-
-  /** Deterministic token = sha256(secret : discordId). */
-  public computeToken(discordId: string): string {
-    return createHash("sha256").update(`${RELAY_AUTH_SECRET}:${discordId}`).digest("hex");
-  }
-
   /** Gracefully close all connections and shut down the WSS. */
-  public shutdown(): void {
+  shutdown(): void {
     this.wss.clients.forEach((ws) => ws.close(1001, "Server shutting down"));
     this.wss.close();
-    console.log("[relay] Server closed");
+    log.info("[relay] Server closed");
   }
 }
+
+// ---------------------------------------------------------------------------
+// Health check server (#10 — real health endpoint)
+// ---------------------------------------------------------------------------
+const healthServer = createHttpServer((req, res) => {
+  if (req.url === "/health") {
+    const healthy = discord.ws.status === 1 && relay !== undefined; // status 1 = READY
+    res.writeHead(healthy ? 200 : 503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      status: healthy ? "ok" : "degraded",
+      discordReady: discord.ws.status === 1,
+      connectedClients: relay?.getConnectedCount() ?? 0,
+      uptime: process.uptime(),
+    }));
+    return;
+  }
+  res.writeHead(404).end();
+});
+healthServer.listen(HEALTH_PORT, () => {
+  log.info({ port: HEALTH_PORT }, "[health] HTTP health endpoint listening");
+});
+healthServer.unref?.();
 
 // ---------------------------------------------------------------------------
 // Discord Bot setup
 // ---------------------------------------------------------------------------
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds], // slash commands only — minimal intents
+  intents: [GatewayIntentBits.Guilds],
 });
 
 // Slash command definitions
@@ -219,7 +389,7 @@ const dropCommand = new SlashCommandBuilder()
   .setName("drop")
   .setDescription("Drop media onto a user's screen via MemeDrip overlay")
   .addStringOption((o) =>
-    o.setName("media_url").setDescription("Direct URL to image / GIF / video / audio").setRequired(true),
+    o.setName("media_url").setDescription("Direct URL to image / GIF / video / audio, or 'random'").setRequired(true),
   )
   .addUserOption((o) => o.setName("target").setDescription("Who receives the drop").setRequired(true))
   .addStringOption((o) =>
@@ -235,6 +405,30 @@ const dropCommand = new SlashCommandBuilder()
   )
   .addIntegerOption((o) =>
     o.setName("duration").setDescription("Display duration in seconds (default 5, max 60)").setMinValue(1).setMaxValue(60),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("position")
+      .setDescription("Where on screen to display (default: center)")
+      .addChoices(
+        { name: "center", value: "center" },
+        { name: "top-left", value: "top-left" },
+        { name: "top-right", value: "top-right" },
+        { name: "bottom-left", value: "bottom-left" },
+        { name: "bottom-right", value: "bottom-right" },
+        { name: "random", value: "random" },
+      ),
+  )
+  .addStringOption((o) =>
+    o
+      .setName("scale")
+      .setDescription("Size of the media (default: normal)")
+      .addChoices(
+        { name: "small", value: "small" },
+        { name: "normal", value: "normal" },
+        { name: "large", value: "large" },
+        { name: "fullscreen", value: "fullscreen" },
+      ),
   );
 
 const reactCommand = new SlashCommandBuilder()
@@ -254,26 +448,41 @@ async function registerCommands(): Promise<void> {
   const body = [dropCommand.toJSON(), reactCommand.toJSON()];
   try {
     if (DISCORD_GUILD_ID) {
-      // Guild-scoped = instant registration (great for dev)
       await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body });
-      console.log(`[discord] Registered guild commands in ${DISCORD_GUILD_ID}`);
+      log.info({ guild: DISCORD_GUILD_ID }, "[discord] Registered guild commands");
     } else {
-      // Global = propagates within ~1h
       await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body });
-      console.log("[discord] Registered global commands");
+      log.info("[discord] Registered global commands");
     }
   } catch (err) {
-    console.error("[discord] Command registration failed:", err);
+    log.fatal({ err }, "[discord] Command registration failed");
     process.exit(1);
   }
 }
 
 // ---------------------------------------------------------------------------
-// URL validation — block obviously malicious inputs
+// URL validation (#2 — HTTPS-only, SSRF protection)
 // ---------------------------------------------------------------------------
 const ALLOWED_MEDIA_EXTENSIONS = [
   ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
 ];
+
+// Private IP ranges to block (SSRF protection)
+const PRIVATE_IP_PATTERNS = [
+  /^127\./,         // loopback
+  /^10\./,          // private class A
+  /^192\.168\./,    // private class C
+  /^172\.(1[6-9]|2[0-9]|3[0-1])\./, // private class B
+  /^169\.254\./,    // link-local
+  /^0\./,           // "this" network
+  /^::1$/,          // IPv6 loopback
+  /^fc00:/i,        // IPv6 unique local
+  /^fe80:/i,        // IPv6 link-local
+];
+
+function isPrivateIP(hostname: string): boolean {
+  return PRIVATE_IP_PATTERNS.some((p) => p.test(hostname));
+}
 
 function validateMediaUrl(raw: string): { ok: boolean; mediaType?: MediaType; reason?: string } {
   let url: URL;
@@ -282,15 +491,24 @@ function validateMediaUrl(raw: string): { ok: boolean; mediaType?: MediaType; re
   } catch {
     return { ok: false, reason: "Not a valid URL" };
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") {
-    return { ok: false, reason: "Only http(s) URLs are allowed" };
+  // #2 — enforce HTTPS only (prevents SSRF to internal HTTP services)
+  if (url.protocol !== "https:") {
+    return { ok: false, reason: "Only HTTPS URLs are allowed" };
   }
+  // #2 — block private/internal IPs (SSRF protection)
+  if (isPrivateIP(url.hostname)) {
+    return { ok: false, reason: "Internal/private IPs are blocked" };
+  }
+  // Allow Discord CDN for custom emoji
+  const isDiscordCdn = url.hostname.endsWith(".discordapp.com")
+    || url.hostname.endsWith(".discord.com")
+    || url.hostname.endsWith(".tenor.com")
+    || url.hostname.endsWith(".giphy.com");
   const pathname = url.pathname.toLowerCase();
   const ext = pathname.slice(pathname.lastIndexOf("."));
-  if (!ALLOWED_MEDIA_EXTENSIONS.includes(ext)) {
+  if (!ALLOWED_MEDIA_EXTENSIONS.includes(ext) && !isDiscordCdn) {
     return { ok: false, reason: `Blocked file extension: ${ext || "(none)"}` };
   }
-  // Auto-detect media type from extension if not provided
   const typeMap: Record<string, MediaType> = {
     ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
     ".gif": "gif",
@@ -301,10 +519,49 @@ function validateMediaUrl(raw: string): { ok: boolean; mediaType?: MediaType; re
 }
 
 // ---------------------------------------------------------------------------
+// /drop random support (#15)
+// ---------------------------------------------------------------------------
+const MEDIA_TYPE_MAP: Record<string, MediaType> = {
+  ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
+  ".gif": "gif",
+  ".mp4": "video", ".webm": "video", ".mov": "video",
+  ".mp3": "audio", ".wav": "audio", ".ogg": "audio",
+};
+
+function getRandomMediaFile(): { url: string; mediaType: MediaType } | null {
+  if (!MEDIA_DIR) return null;
+  try {
+    const files = readdirSync(MEDIA_DIR).filter((f) => {
+      const ext = extname(f).toLowerCase();
+      return ALLOWED_MEDIA_EXTENSIONS.includes(ext);
+    });
+    if (files.length === 0) return null;
+    const pick = files[Math.floor(Math.random() * files.length)];
+    const ext = extname(pick).toLowerCase();
+    return {
+      url: `file://${join(MEDIA_DIR, pick)}`,
+      mediaType: MEDIA_TYPE_MAP[ext] ?? "image",
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Discord interaction buttons (#13 — Skip / Clear / Pause)
+// ---------------------------------------------------------------------------
+function buildControlButtons(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("memedrip_skip").setLabel("⏭ Skip").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("memedrip_clear").setLabel("🗑 Clear").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("memedrip_pause").setLabel("⏸ Pause").setStyle(ButtonStyle.Secondary),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Interaction handler
 // ---------------------------------------------------------------------------
 discord.on(Events.InteractionCreate, async (interaction) => {
-  // Narrow to chat-input slash commands; ignore buttons, menus, etc.
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "drop") {
@@ -314,25 +571,82 @@ discord.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+// #13 — handle button interactions
+discord.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+  if (!interaction.customId.startsWith("memedrip_")) return;
+
+  // Find the target ID from the message — we encoded it in the ephemeral reply
+  // The sender's ephemeral reply mentions the target. We need to extract it.
+  // Better approach: store a mapping from message id → targetId when we send the reply.
+  // For simplicity, we parse the target from the message content.
+  const content = interaction.message.content || "";
+  const targetMatch = content.match(/<@!?(\d+)>/);
+  if (!targetMatch) {
+    await interaction.reply({ content: "Could not determine target.", ephemeral: true });
+    return;
+  }
+  const targetId = targetMatch[1];
+  const action = interaction.customId.replace("memedrip_", "") as ControlAction;
+
+  const delivered = relay.sendControl(targetId, action as ControlAction);
+  if (!delivered) {
+    await interaction.reply({ content: "Target is no longer online.", ephemeral: true });
+    return;
+  }
+  await interaction.reply({ content: `Sent **${action}** to <@${targetId}>.`, ephemeral: true });
+});
+
 async function handleDrop(interaction: ChatInputCommandInteraction): Promise<void> {
-  const mediaUrl = interaction.options.getString("media_url", true);
+  const mediaUrlInput = interaction.options.getString("media_url", true);
   const targetUser = interaction.options.getUser("target", true);
   const explicitType = interaction.options.getString("type") as MediaType | null;
   const durationSec = interaction.options.getInteger("duration") ?? 5;
+  const position = (interaction.options.getString("position") as OverlayPosition | null) ?? "center";
+  const scale = (interaction.options.getString("scale") as OverlayScale | null) ?? "normal";
 
-  const validation = validateMediaUrl(mediaUrl);
-  if (!validation.ok) {
-    await interaction.reply({ content: `❌ Invalid media URL: ${validation.reason}`, ephemeral: true });
+  // #1 — rate limiting
+  if (!rateLimiter.check(interaction.user.id)) {
+    await interaction.reply({
+      content: `⏱️ Slow down! You've reached the limit of ${RATE_LIMIT_MAX_DROPS} drops per minute.`,
+      ephemeral: true,
+    });
     return;
+  }
+
+  // #15 — /drop random
+  let finalUrl = mediaUrlInput;
+  let autoMediaType: MediaType | undefined;
+  if (mediaUrlInput.toLowerCase() === "random") {
+    const random = getRandomMediaFile();
+    if (!random) {
+      await interaction.reply({
+        content: "❌ No media files found in the configured MEDIA_DIR.",
+        ephemeral: true,
+      });
+      return;
+    }
+    finalUrl = random.url;
+    autoMediaType = random.mediaType;
+  } else {
+    // #2 — URL validation
+    const validation = validateMediaUrl(mediaUrlInput);
+    if (!validation.ok) {
+      await interaction.reply({ content: `❌ Invalid media URL: ${validation.reason}`, ephemeral: true });
+      return;
+    }
+    autoMediaType = validation.mediaType;
   }
 
   const payload: MediaPayload = {
     id: randomUUID(),
     senderId: interaction.user.id,
     targetId: targetUser.id,
-    mediaType: explicitType ?? validation.mediaType ?? "image",
-    url: mediaUrl,
+    mediaType: explicitType ?? autoMediaType ?? "image",
+    url: finalUrl,
     duration: Math.min(durationSec, 60) * 1000,
+    position,
+    scale,
     timestamp: Date.now(),
   };
 
@@ -345,8 +659,12 @@ async function handleDrop(interaction: ChatInputCommandInteraction): Promise<voi
     return;
   }
 
+  log.info({ payloadId: payload.id, senderId: payload.senderId, targetId: payload.targetId }, "[drop] delivered");
+
+  // #13 — reply with control buttons
   await interaction.reply({
     content: `🎨 Dropped **${payload.mediaType}** onto <@${targetUser.id}>'s screen!`,
+    components: [buildControlButtons()],
     ephemeral: true,
   });
 }
@@ -356,8 +674,15 @@ async function handleReact(interaction: ChatInputCommandInteraction): Promise<vo
   const targetUser = interaction.options.getUser("target", true);
   const durationSec = interaction.options.getInteger("duration") ?? 3;
 
-  // Render emoji as text overlay — no URL needed, we pass it as a "label".
-  // If it's a custom Discord emoji, extract the image CDN URL.
+  // #1 — rate limiting
+  if (!rateLimiter.check(interaction.user.id)) {
+    await interaction.reply({
+      content: `⏱️ Slow down! You've reached the limit of ${RATE_LIMIT_MAX_DROPS} drops per minute.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
   let emojiUrl: string | undefined;
   const customMatch = emoji.match(/<a?:(\w+):(\d+)>/);
   let mediaType: MediaType = "image";
@@ -372,7 +697,7 @@ async function handleReact(interaction: ChatInputCommandInteraction): Promise<vo
     senderId: interaction.user.id,
     targetId: targetUser.id,
     mediaType,
-    url: emojiUrl ?? "", // empty url = render as text label
+    url: emojiUrl ?? "",
     duration: Math.min(durationSec, 30) * 1000,
     label: emojiUrl ? undefined : emoji,
     timestamp: Date.now(),
@@ -387,8 +712,11 @@ async function handleReact(interaction: ChatInputCommandInteraction): Promise<vo
     return;
   }
 
+  log.info({ payloadId: payload.id, senderId: payload.senderId, targetId: payload.targetId }, "[react] delivered");
+
   await interaction.reply({
     content: `⚡ Reacted ${emoji} onto <@${targetUser.id}>'s screen!`,
+    components: [buildControlButtons()],
     ephemeral: true,
   });
 }
@@ -396,24 +724,41 @@ async function handleReact(interaction: ChatInputCommandInteraction): Promise<vo
 // ---------------------------------------------------------------------------
 // Bot lifecycle
 // ---------------------------------------------------------------------------
-const relay = new RelayServer(WS_PORT);
+const useTLS = TLS_CERT_PATH !== "" && TLS_KEY_PATH !== "";
+const relay = new RelayServer(WS_PORT, useTLS);
 
 discord.once(Events.ClientReady, async (c) => {
-  console.log(`[discord] Logged in as ${c.user.tag}`);
+  log.info({ tag: c.user.tag }, "[discord] Logged in");
   await registerCommands();
 });
 
 discord.on(Events.Error, (err) => {
-  console.error("[discord] Client error:", err);
+  log.error({ err }, "[discord] Client error");
+});
+
+// ---------------------------------------------------------------------------
+// #4 — Global error handlers to prevent silent crashes
+// ---------------------------------------------------------------------------
+process.on("unhandledRejection", (reason) => {
+  log.error({ err: reason }, "[process] Unhandled rejection");
+});
+
+process.on("uncaughtException", (err) => {
+  log.fatal({ err }, "[process] Uncaught exception — shutting down");
+  shutdown("uncaughtException");
 });
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
+let shuttingDown = false;
 function shutdown(signal: string): void {
-  console.log(`\n[shutdown] Received ${signal}, closing connections…`);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log.info({ signal }, "[shutdown] Closing connections…");
   discord.destroy();
   relay.shutdown();
+  healthServer.close();
   process.exit(0);
 }
 
@@ -424,6 +769,6 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 // Boot
 // ---------------------------------------------------------------------------
 discord.login(DISCORD_TOKEN).catch((err) => {
-  console.error("[discord] Login failed:", err);
+  log.fatal({ err }, "[discord] Login failed");
   process.exit(1);
 });

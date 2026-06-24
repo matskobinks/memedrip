@@ -12,6 +12,8 @@
   "dependencies": {
     "@memedrip/shared-types": "*",
     "discord.js": "^14.14.1",
+    "pino": "^9.1.0",
+    "pino-pretty": "^11.2.1",
     "ws": "^8.17.0"
   },
   "devDependencies": {

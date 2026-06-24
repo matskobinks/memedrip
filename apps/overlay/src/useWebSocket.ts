@@ -4,6 +4,9 @@
  * Connects to the MemeDrip relay server with exponential backoff
  * auto-reconnection. Authenticates on connect, handles ping/pong
  * heartbeats, and feeds incoming MediaPayloads into the queue store.
+ *
+ * Upgrades:
+ *   - Handles "control" messages (skip/clear/pause/resume)
  */
 
 import { useEffect, useRef } from "react";
@@ -27,6 +30,7 @@ const HEARTBEAT_INTERVAL_MS = 25_000;
  */
 export function useRelayConnection(): void {
   const enqueue = useMediaQueue((s) => s.enqueue);
+  const control = useMediaQueue((s) => s.control);
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(INITIAL_BACKOFF_MS);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -48,9 +52,8 @@ export function useRelayConnection(): void {
 
       ws.addEventListener("open", () => {
         console.log("[ws] Connected — sending auth");
-        backoffRef.current = INITIAL_BACKOFF_MS; // reset backoff
+        backoffRef.current = INITIAL_BACKOFF_MS;
         send(ws, { type: "auth", token: AUTH_TOKEN, discordId: DISCORD_ID });
-        // Start heartbeat
         heartbeatTimerRef.current = setInterval(() => {
           send(ws, { type: "ping" });
         }, HEARTBEAT_INTERVAL_MS);
@@ -71,18 +74,21 @@ export function useRelayConnection(): void {
             break;
           case "auth_error":
             console.error("[ws] Auth failed:", msg.reason);
-            shouldReconnectRef.current = false; // don't retry on auth failure
+            shouldReconnectRef.current = false;
             ws.close();
             break;
           case "ping":
             send(ws, { type: "pong" });
             break;
           case "pong":
-            // Heartbeat response — nothing to do
             break;
           case "media":
             console.log("[ws] Received media payload:", msg.payload.id);
             enqueue(msg.payload as MediaPayload);
+            break;
+          case "control":
+            console.log("[ws] Received control:", msg.action);
+            control(msg.action);
             break;
           case "error":
             console.warn("[ws] Server error:", msg.reason);
@@ -100,7 +106,6 @@ export function useRelayConnection(): void {
 
       ws.addEventListener("error", (event) => {
         console.error("[ws] Socket error:", event);
-        // The close handler will trigger reconnect
       });
     }
 
@@ -129,7 +134,6 @@ export function useRelayConnection(): void {
 
     connect();
 
-    // Cleanup on unmount
     return () => {
       shouldReconnectRef.current = false;
       cleanup();
@@ -139,5 +143,5 @@ export function useRelayConnection(): void {
         wsRef.current = null;
       }
     };
-  }, [enqueue]);
+  }, [enqueue, control]);
 }
